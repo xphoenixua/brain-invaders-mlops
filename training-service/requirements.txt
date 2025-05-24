@@ -1,0 +1,9 @@
+pandas
+pyarrow
+numpy
+mne
+boto3
+urllib3
+scikit-learn
+joblib
+wandb

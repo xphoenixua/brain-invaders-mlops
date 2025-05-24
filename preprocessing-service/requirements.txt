@@ -1,0 +1,6 @@
+pandas
+pyarrow # For parquet
+numpy
+mne
+boto3
+# scikit-learn if any preprocessing step uses it directly

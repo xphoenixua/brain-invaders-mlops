@@ -1,0 +1,101 @@
+services:
+  minio-server:
+    image: minio/minio:latest
+    container_name: minio-server
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio_data_volume:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  minio-init:
+    build: ./minio-init
+    container_name: minio-init
+    environment:
+      MINIO_ENDPOINT: http://minio-server:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      LANDING_ZONE_BUCKET_NAME: p300-landing-zone
+      RAW_BUCKET_NAME: p300-raw-data
+      PROCESSED_BUCKET_NAME: p300-processed-features
+      MODELS_BUCKET_NAME: p300-models
+      LOCAL_ALL_RAW_PATH: /data_to_upload/all_raw_subjects
+    volumes:
+      - ./initial_data_for_minio:/data_to_upload:ro
+    depends_on:
+      minio-server:
+        condition: service_healthy
+    restart: "no" # single-run initialization job
+
+  preprocessing-job:
+    build: ./preprocessing-service
+    environment:
+      MINIO_ENDPOINT: http://minio-server:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      MINIO_RAW_BUCKET: p300-raw-data
+      MINIO_PROCESSED_BUCKET: p300-processed-features
+    depends_on:
+      minio-server:
+        condition: service_healthy
+
+  training-job:
+    build: ./training-service
+    env_file: ./.env
+    environment:
+      MINIO_ENDPOINT: http://minio-server:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      MINIO_PROCESSED_BUCKET: p300-processed-features
+      MINIO_MODELS_BUCKET: p300-models
+    depends_on:
+      minio-server:
+        condition: service_healthy
+
+  model-serving-service:
+    build: ./model-serving-service
+    container_name: model-serving-service
+    ports:
+      - "8000:8000"
+    environment:
+      MINIO_ENDPOINT: http://minio-server:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      MINIO_MODELS_BUCKET: p300-models
+      DEFAULT_ACTIVE_MODEL_VERSION: "v_initial_placeholder"
+    depends_on:
+      minio-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  app-simulator-job:
+    build: ./application-simulator
+    environment:
+      MINIO_ENDPOINT: http://minio-server:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      MINIO_PROCESSED_BUCKET: p300-processed-features
+      SERVING_API_URL: http://model-serving-service:8000/predict/
+    depends_on:
+      minio-server:
+        condition: service_healthy
+      model-serving-service:
+        condition: service_healthy
+
+volumes:
+  minio_data_volume:
