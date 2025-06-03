@@ -13,6 +13,7 @@ LANDING_ZONE_BUCKET_NAME = os.getenv("LANDING_ZONE_BUCKET_NAME")
 RAW_BUCKET_NAME = os.getenv("RAW_BUCKET_NAME")
 PROCESSED_BUCKET_NAME = os.getenv("PROCESSED_BUCKET_NAME")
 MODELS_BUCKET_NAME = os.getenv("MODELS_BUCKET_NAME")
+MLFLOW_ARTIFACT_BUCKET_NAME = os.getenv("MLFLOW_ARTIFACT_BUCKET_NAME")
 
 MINIO_WAIT_RETRIES = 20
 MINIO_WAIT_DELAY_SECONDS = 5
@@ -92,11 +93,12 @@ def initialize_minio_buckets():
         LANDING_ZONE_BUCKET_NAME,
         RAW_BUCKET_NAME,
         PROCESSED_BUCKET_NAME,
-        MODELS_BUCKET_NAME
+        MODELS_BUCKET_NAME,
+        MLFLOW_ARTIFACT_BUCKET_NAME
     ]
 
     for bucket_name in buckets_to_create:
-        if not bucket_name: continue
+        if not bucket_name: continue # skip if bucket name is empty string from env
         try:
             create_bucket_if_not_exists(s3, bucket_name)
         except RuntimeError as e:

@@ -29,6 +29,7 @@ services:
       RAW_BUCKET_NAME: p300-raw-data
       PROCESSED_BUCKET_NAME: p300-processed-features
       MODELS_BUCKET_NAME: p300-models
+      MLFLOW_ARTIFACT_BUCKET_NAME: ${MLFLOW_ARTIFACT_BUCKET_NAME}
       LOCAL_ALL_RAW_PATH: /data_to_upload/all_raw_subjects
     volumes:
       - ./initial_data_for_minio:/data_to_upload:ro
@@ -36,6 +37,52 @@ services:
       minio-server:
         condition: service_healthy
     restart: "no" # single-run initialization job
+
+  postgres-mlflow:
+    image: postgres:latest
+    container_name: postgres-mlflow
+    environment:
+      POSTGRES_USER: ${MLFLOW_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${MLFLOW_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${MLFLOW_POSTGRES_DB}
+    volumes:
+      - mlflow_postgres_data_volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${MLFLOW_POSTGRES_USER} -d ${MLFLOW_POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: always
+
+  mlflow-server:
+    build: ./mlflow-server-custom
+    container_name: mlflow-server
+    ports:
+      - "5001:5000"
+    environment:
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      MLFLOW_S3_ENDPOINT_URL: http://minio-server:9000
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri postgresql://${MLFLOW_POSTGRES_USER}:${MLFLOW_POSTGRES_PASSWORD}@postgres-mlflow:5432/${MLFLOW_POSTGRES_DB}
+      --default-artifact-root s3://${MLFLOW_ARTIFACT_BUCKET_NAME}/
+      --serve-artifacts
+    depends_on:
+      minio-server:
+        condition: service_healthy
+      postgres-mlflow:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: always
 
   preprocessing-job:
     build: ./preprocessing-service
@@ -62,40 +109,80 @@ services:
       minio-server:
         condition: service_healthy
 
-  model-serving-service:
+  model-serving-champion:
     build: ./model-serving-service
-    container_name: model-serving-service
-    ports:
-      - "8000:8000"
     environment:
       MINIO_ENDPOINT: http://minio-server:9000
       MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
-      MINIO_MODELS_BUCKET: p300-models
-      DEFAULT_ACTIVE_MODEL_VERSION: "v_initial_placeholder"
+      MLFLOW_TRACKING_URI: http://mlflow-server:5000
+      MLFLOW_S3_ENDPOINT_URL: http://minio-server:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD} 
+      MLFLOW_REGISTERED_MODEL_NAME: "P300-Classifier"
+      SERVING_MODEL_ALIAS: "champion"
     depends_on:
-      minio-server:
-        condition: service_healthy
+      minio-server: { condition: service_healthy }
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    deploy:
+      replicas: 2
+
+  model-serving-challenger:
+    build: ./model-serving-service
+    environment:
+      MINIO_ENDPOINT: http://minio-server:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      MLFLOW_TRACKING_URI: http://mlflow-server:5000
+      MLFLOW_S3_ENDPOINT_URL: http://minio-server:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      MLFLOW_REGISTERED_MODEL_NAME: "P300-Classifier"
+      SERVING_MODEL_ALIAS: "challenger"
+    depends_on:
+      minio-server: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  nginx-load-balancer:
+    image: nginx:latest
+    container_name: nginx-load-balancer
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - model-serving-champion
+      - model-serving-challenger
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/nginx_health"]
       interval: 10s
       timeout: 5s
-      retries: 5
-      start_period: 10s
+      retries: 3
+      start_period: 5s
+    restart: always
 
-  app-simulator-job:
+  application-simulator:
     build: ./application-simulator
     environment:
       MINIO_ENDPOINT: http://minio-server:9000
       MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
       MINIO_PROCESSED_BUCKET: p300-processed-features
-      SERVING_API_URL: http://model-serving-service:8000/predict/
+      SERVING_API_URL: http://nginx-load-balancer/predict-champion/
     depends_on:
-      minio-server:
-        condition: service_healthy
-      model-serving-service:
-        condition: service_healthy
+      minio-server: { condition: service_healthy }
+      nginx-load-balancer: { condition: service_healthy }
 
 volumes:
   minio_data_volume:
+  mlflow_postgres_data_volume:

@@ -5,7 +5,13 @@ import io
 import joblib
 import numpy as np
 import pandas as pd
-import wandb
+import tempfile
+
+import mlflow
+import mlflow.sklearn
+from mlflow.models.signature import ModelSignature
+from mlflow.types.schema import Schema, ColSpec
+from mlflow.tracking import MlflowClient
 
 import boto3
 from botocore.config import Config as BotoConfig
@@ -31,8 +37,17 @@ MODEL_CONFIG = {
     "lda_shrinkage": "auto",
     "ridge_alphas": np.logspace(-3, 3, 7)
 }
-TARGET_CLASS_LABEL_CODE = 2 # original label code for 'target'
 
+TARGET_CLASS_LABEL_CODE = 2
+MLFLOW_TRACKING_URI_FALLBACK = "http://mlflow-server:5000"
+MLFLOW_EXPERIMENT_NAME = "P300_BCI_Training"
+MLFLOW_REGISTERED_MODEL_NAME = "P300-Classifier"
+
+# this is crucial for mlflow.log_artifacts to work with minio
+# for some reason, mlflow doesn't pick up the environment variables set in the minio-init container
+os.environ["MLFLOW_S3_ENDPOINT_URL"] = os.getenv("MLFLOW_S3_ENDPOINT_URL", MINIO_ENDPOINT)
+os.environ["AWS_ACCESS_KEY_ID"] = os.getenv("AWS_ACCESS_KEY_ID", MINIO_ACCESS_KEY)
+os.environ["AWS_SECRET_ACCESS_KEY"] = os.getenv("AWS_SECRET_ACCESS_KEY", MINIO_SECRET_KEY)
 
 # s3 client initialization
 def create_s3_client(endpoint, access_key, secret_key):
@@ -102,7 +117,7 @@ def train_model_sklearn(x_train, y_train, model_config, scaler_instance=None):
 
     model.fit(x_train_scaled, y_train)
     if model_config['type'] == "Ridge": print(f"    ridge best alpha: {model.alpha_}")
-    return model
+    return model, x_train_scaled
 
 
 def evaluate_model_sklearn(model, x_test, y_test, scaler_instance=None):
@@ -147,7 +162,8 @@ def evaluate_model_sklearn(model, x_test, y_test, scaler_instance=None):
     }
 
 
-def main_training_pipeline(training_subjects_percentage: float, internal_val_split_ratio=0.8, cli_model_version=None):
+def main_training_pipeline(training_subjects_percentage: float, internal_val_split_ratio=0.8, 
+                           cli_model_version=None, auto_set_alias=True):
     """
     runs the full training pipeline, including data download, model training,
     evaluation, and logging to W&B and MinIO
@@ -162,26 +178,31 @@ def main_training_pipeline(training_subjects_percentage: float, internal_val_spl
         print("no subjects to use for training. exiting")
         return
 
-    subject_ids_for_this_run = available_subject_ids[:num_subjects_to_use]
+    subject_ids = available_subject_ids[:num_subjects_to_use]
 
-    model_version_to_use = cli_model_version if cli_model_version else f"v{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}"
+    model_version_tag = cli_model_version if cli_model_version else f"v{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}"
 
-    wandb.init(
-        project="p300-bci-mlops",
-        name=f"train_{model_version_to_use}_on_{num_subjects_to_use}subjects",
-        job_type="training"
-    )
-    wandb.config.training_subjects_percentage = training_subjects_percentage
-    wandb.config.internal_val_split_ratio = internal_val_split_ratio
-    wandb.config.model_type = MODEL_CONFIG['type']
-    wandb.config.subject_ids_trained_on = subject_ids_for_this_run
-    wandb.config.num_subjects_trained_on = len(subject_ids_for_this_run)
-    wandb.config.total_processed_subjects_available = len(available_subject_ids)
-    wandb.config.model_version_saved = model_version_to_use
+    # mlflow setup
+    mlflow_tracking_uri = os.getenv("MLFLOW_TRACKING_URI", MLFLOW_TRACKING_URI_FALLBACK)
+    mlflow.set_tracking_uri(mlflow_tracking_uri)
+    client = MlflowClient(tracking_uri=mlflow_tracking_uri)
+    print(f"mlflow tracking uri confirmed by client: {mlflow.get_tracking_uri()}")
+    experiment = mlflow.get_experiment_by_name(MLFLOW_EXPERIMENT_NAME)
 
-    print(f"starting training pipeline for {len(subject_ids_for_this_run)} subjects: {subject_ids_for_this_run}")
+    if experiment is None:
+        try:
+            experiment_id = mlflow.create_experiment(MLFLOW_EXPERIMENT_NAME) # uses default artifact root from server
+            print(f"MLflow experiment '{MLFLOW_EXPERIMENT_NAME}' created with id: {experiment_id}")
+            mlflow.set_experiment(experiment_id=experiment_id)
+        except mlflow.exceptions.MlflowException as e_create:
+            print(f"MLflow: error creating experiment '{MLFLOW_EXPERIMENT_NAME}': {e_create}.")
+    else:
+        print(f"MLflow experiment '{MLFLOW_EXPERIMENT_NAME}' already exists with id: {experiment.experiment_id}")
+        mlflow.set_experiment(experiment_name=MLFLOW_EXPERIMENT_NAME)
+
+    print(f"starting training pipeline for {len(subject_ids)} subjects: {subject_ids}")
     all_x, all_y = [], []
-    for sub_id in subject_ids_for_this_run:
+    for sub_id in subject_ids:
         x_sub, y_sub = download_subject_processed_data(s3_client, MINIO_PROCESSED_BUCKET, sub_id)
         if x_sub is not None and y_sub is not None and x_sub.shape[0] > 0:
             all_x.append(x_sub)
@@ -190,7 +211,6 @@ def main_training_pipeline(training_subjects_percentage: float, internal_val_spl
             print(f"    skipping subject {sub_id:02d} due to missing or empty data")
     if not all_x:
         print("no data loaded for selected subjects. exiting")
-        wandb.finish()
         return
 
     x_combined = np.vstack(all_x)
@@ -198,7 +218,6 @@ def main_training_pipeline(training_subjects_percentage: float, internal_val_spl
     print(f"combined data: x={x_combined.shape}, labels: {np.unique(y_combined)}")
     if len(np.unique(y_combined)) < 2:
         print("need 2 or more classes for training. exiting")
-        wandb.finish()
         return
 
     x_train, x_val, y_train, y_val = train_test_split(
@@ -206,51 +225,87 @@ def main_training_pipeline(training_subjects_percentage: float, internal_val_spl
         stratify=y_combined, random_state=42
     )
     print(f"internal train set: {x_train.shape}, internal validation set: {x_val.shape}")
-    wandb.config.internal_training_set_size = x_train.shape[0]
-    wandb.config.internal_validation_set_size = x_val.shape[0]
 
-    scaler = StandardScaler()
-    trained_model = train_model_sklearn(x_train, y_train, MODEL_CONFIG, scaler_instance=scaler)
-    print(f"model classes after fitting: {trained_model.classes_}")
+    # start MLflow run
+    with mlflow.start_run(run_name=f"train_run_{model_version_tag}") as run:
+        run_id = run.info.run_id
+        print(f"mlflow run started. run id: {run_id}")
 
-    print("\ninternal validation set evaluation")
-    val_metrics_dict = evaluate_model_sklearn(trained_model, x_val, y_val, scaler_instance=scaler)
+        mlflow_params = {
+            "training_subjects_percentage": training_subjects_percentage, "internal_val_split_ratio": internal_val_split_ratio,
+            "model_type": MODEL_CONFIG['type'], "num_subjects_trained_on": len(subject_ids),
+            "subject_ids_trained_on_list_str": str(subject_ids),
+            "total_processed_subjects_available": len(available_subject_ids),
+            "generated_model_version_tag": model_version_tag,
+            "internal_training_set_size": x_train.shape[0], "internal_validation_set_size": x_val.shape[0]
+        }
 
-    wandb.log(val_metrics_dict, step=num_subjects_to_use)
+        if MODEL_CONFIG['type'] == "LDA": mlflow_params.update({"lda_solver": MODEL_CONFIG.get("lda_solver"), 
+                                                                "lda_shrinkage": MODEL_CONFIG.get("lda_shrinkage")})
+        elif MODEL_CONFIG['type'] == "Ridge": mlflow_params["ridge_alphas"] = str(MODEL_CONFIG.get("ridge_alphas"))
+        
+        mlflow.log_params(mlflow_params)
 
-    print(f"\nusing model version: {model_version_to_use}")
-    s3_model_key = f"{model_version_to_use}/model.joblib"
-    s3_scaler_key = f"{model_version_to_use}/scaler.joblib"
-    active_pointer_key = "active_model_pointer.txt"
-    local_model_path = "./model.joblib"
-    local_scaler_path = "./scaler.joblib"
 
-    joblib.dump(trained_model, local_model_path)
-    joblib.dump(scaler, local_scaler_path)
+        scaler = StandardScaler()
+        trained_model, x_train_scaled = train_model_sklearn(x_train, y_train, MODEL_CONFIG, scaler_instance=scaler)
+        print(f"model classes after fitting: {trained_model.classes_}")
 
-    try:
-        s3_client.upload_file(local_model_path, MINIO_MODELS_BUCKET, s3_model_key)
-        s3_client.upload_file(local_scaler_path, MINIO_MODELS_BUCKET, s3_scaler_key)
-        s3_client.put_object(Bucket=MINIO_MODELS_BUCKET, Key=active_pointer_key, Body=model_version_to_use.encode('utf-8'))
+        print("\ninternal validation set evaluation")
+        val_metrics_dict = evaluate_model_sklearn(trained_model, x_val, y_val, scaler_instance=scaler)
 
-        model_artifact = wandb.Artifact(
-            name=model_version_to_use,
-            type="model",
-            description=f"model trained on {num_subjects_to_use} subjects. validation auc: {val_metrics_dict.get('auc', 'n/a'):.4f}",
-            metadata={"num_subjects": num_subjects_to_use, "val_metrics": val_metrics_dict}
-        )
-        model_artifact.add_file(local_model_path, name="model.joblib")
-        model_artifact.add_file(local_scaler_path, name="scaler.joblib")
-        wandb.log_artifact(model_artifact)
-        print("  model artifacts uploaded and w&b artifact logged")
-    except Exception as e:
-        print(f"  error during minio or w&b artifact upload: {e}")
-    finally:
-        if os.path.exists(local_model_path): os.remove(local_model_path)
-        if os.path.exists(local_scaler_path): os.remove(local_scaler_path)
+        mlflow.log_metrics(val_metrics_dict)
 
-    wandb.finish()
-    print(f"finished training pipeline. active model version: {model_version_to_use}")
+        # infer signature for MLflow model
+        model_signature = None
+        input_example_data = None
+
+        if x_train_scaled.shape[0] > 0:
+            num_features = x_train_scaled.shape[1]
+            input_schema = Schema([ColSpec("double", f"feature_{i}") for i in range(num_features)])
+            if hasattr(trained_model, "predict_proba"):
+                output_schema = Schema([ColSpec("double", "probability_class_0"), 
+                                        ColSpec("double", "probability_class_1")])
+            else:
+                output_schema = Schema([ColSpec("integer", "prediction")])
+            model_signature = ModelSignature(inputs=input_schema, outputs=output_schema)
+            input_example_data = pd.DataFrame(x_train_scaled[:min(5, x_train_scaled.shape[0]), :], 
+                                              columns=[f"feature_{i}" for i in range(num_features)])
+            print("mlflow: model signature defined explicitly.")
+        else: 
+            print("mlflow: skipping model signature, no training data.")
+
+        registered_model_info = None
+        with tempfile.TemporaryDirectory() as tmp_path:
+            model_saved_path = os.path.join(tmp_path, "model_payload")
+            scaler_saved_path = os.path.join(tmp_path, "scaler_payload")
+
+            mlflow.sklearn.save_model(trained_model, path=model_saved_path, signature=model_signature, input_example=input_example_data)
+            # save scaler without signature/input_example as it's a preprocessor
+            joblib.dump(scaler, scaler_saved_path)
+
+            registered_model_info = mlflow.pyfunc.log_model(
+                python_model=mlflow.pyfunc.PythonModel(),
+                artifact_path="p300-model-with-scaler",
+                artifacts={ "model_dir": model_saved_path, "scaler_file": scaler_saved_path },
+                registered_model_name=MLFLOW_REGISTERED_MODEL_NAME
+            )
+        new_model_version = registered_model_info.registered_model_version
+        print(f"mlflow: model and scaler logged. registered '{MLFLOW_REGISTERED_MODEL_NAME}' version '{new_model_version}'.")
+
+        if auto_set_alias:
+            try:
+                print(f"setting alias 'challenger' for model '{MLFLOW_REGISTERED_MODEL_NAME}' version '{new_model_version}'.")
+                client.set_registered_model_alias(
+                    name=MLFLOW_REGISTERED_MODEL_NAME,
+                    alias='challenger',
+                    version=new_model_version
+                )
+                print(f"alias 'challenger' set successfully.")
+            except Exception as e_alias:
+                print(f"error setting model alias: {e_alias}")
+
+    print(f"finished training pipeline. run id: {run_id}")
 
 
 if __name__ == "__main__":
@@ -259,12 +314,16 @@ if __name__ == "__main__":
                         help="percentage of available processed subjects to use for training (0.0 to 1.0). defaulted to 1.0 (all available)")
     parser.add_argument("--internal_val_split_ratio", type=float, default=0.8,
                         help="ratio for splitting the selected subjects' data into internal train/validation. defaulted to 0.8")
-    parser.add_argument("--model_version", type=str, default=None,
-                        help="optional: specific model version string. if none, a timestamped version is generated")
+    parser.add_argument("--model_version_tag", type=str, default=None, 
+                        help="optional tag for run name (not MLflow model version)")
+    parser.add_argument("--auto_set_alias", default=True, 
+                        help="automatically set the 'challenger' alias for the new model version")
     args = parser.parse_args()
 
     main_training_pipeline(
         training_subjects_percentage=args.training_subjects_percentage,
         internal_val_split_ratio=args.internal_val_split_ratio,
-        cli_model_version=args.model_version
+        cli_model_version=args.model_version_tag,
+        auto_set_alias=args.auto_set_alias
     )
+    
