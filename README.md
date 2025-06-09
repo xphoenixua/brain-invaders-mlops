@@ -99,7 +99,7 @@ We use the `application-simulator` to evaluate the performance of the new challe
    ```
  This completes a cycle of the ability to manage and deploy multiple model versions.
 
-**9. System teardown**
+### 9. System teardown
 To stop all services and remove associated containers, networks, and volumes for a clean state:
    ```bash
    docker compose -f airflow-compose.yaml down -v
