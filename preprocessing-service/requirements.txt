@@ -1,6 +1,5 @@
 pandas
-pyarrow # For parquet
+pyarrow
 numpy
 mne
 boto3
-# scikit-learn if any preprocessing step uses it directly
