@@ -15,17 +15,16 @@ The pipeline is organized into a series of notebooks, designed to be run as task
 5.  **`03_deploy_model`** is an idempotent deployment script. It checks if a serving endpoint exists. If not, it creates one. It then updates the endpoint to serve the latest model in the `Staging` stage as the challenger.
 6.  **`04_run_simulation`** evaluates a deployed model (champion or challenger). It identifies the model version being served, creates a holdout set by excluding subjects the model was trained on, and sends batched inference requests to the model's direct invocation URL. It logs the final performance metrics to MLflow.
 7.  **`05_promote_challenger_to_champion`** automates the promotion process. It identifies the current challenger model, transitions it to the `Production` stage in the registry, and updates the serving endpoint to serve this new version as the champion.
-8.  
 ## How to run
 ### Setup
 *   Create an All-Purpose cluster using a Databricks ML Runtime.
 *   Upload the raw subject data (`subject_XX_eeg_stim.parquet` files) to `/dbfs/FileStore/tables/p300_files/landing-zone/`.
 *   Import all the notebooks into your Databricks workspace.
 ### Create jobs
-* **Job 1: `Ingest_and_Preprocess`** – a job with two sequential tasks running `00_ingest_data` and then `01_orchestrate_preprocessing`.
-* **Job 2: `Train_and_Deploy_Challenger`** – a job with two sequential tasks running `02_train_model` and then `03_deploy_model`.
-* **Job 3: `Evaluate_Model`** – a job running the `04_run_simulation` notebook. Configure its `target_entity_name` parameter to either "champion" or "challenger".
-* **Job 4: `Promote_to_Champion`** – a job running the `05_promote_challenger_to_champion` notebook.
+* Job 1 `Ingest_and_Preprocess` – a job with two sequential tasks running `00_ingest_data` and then `01_orchestrate_preprocessing`.
+* Job 2 `Train_and_Deploy_Challenger` – a job with two sequential tasks running `02_train_model` and then `03_deploy_model`.
+* Job 3 `Evaluate_Model` – a job running the `04_run_simulation` notebook. Configure its `target_entity_name` parameter to either "champion" or "challenger".
+* Job 4 `Promote_to_Champion` – a job running the `05_promote_challenger_to_champion` notebook.
 ### Execution order
 1. Run the `Ingest_and_Preprocess` job to prepare data.
 2. Run the `Train_and_Deploy_Challenger` job to train a model and deploy it.
